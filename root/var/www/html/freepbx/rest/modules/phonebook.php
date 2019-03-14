@@ -77,7 +77,7 @@ $app->post('/phonebook/config[/{id}]', function (Request $request, Response $res
     try {
         $route = $request->getAttribute('route');
         $id = $route->getArgument('id');
-        $newsource = $request->getParsedBody();
+        $data = $request->getParsedBody();
         $config_dir = '/etc/phonebook/sources.d';
 
         if (!isset($id) || empty($id)) {
@@ -87,12 +87,43 @@ $app->post('/phonebook/config[/{id}]', function (Request $request, Response $res
                 $i ++ ;
             }
             $id = 'custom_'.$i;
+            $new = true;
         }
+
+        foreach ( array('dbtype','host','port','user','password','dbname','query') as $var) {
+            if (!isset($data[$var]) || empty($data[$var])) {
+                error_log("Missing value: $var");
+                return $response->withJson(array("status"=>"Missing value: $var"), 400);
+            }
+            $newsource[$var] = $data[$var];
+        }
+
         $file = $config_dir.'/'.$id.'.json';
         $res = file_put_contents($file, json_encode(array($id => $newsource)));
         if ($res === false) {
            throw new Exception("Error writing $file"); 
         }
+
+        if (!isset($data['interval']) || empty($data['interval']) || $data['interval'] < 1 || $data['interval'] >= 1440) {
+            $cron_time_interval = '0 0 * * *' ;
+        } elseif ($data['interval'] < 60) {
+            $cron_time_interval = '*/'.$data['interval'].' * * * *';
+        } elseif ($data['interval'] >= 60 || $data['interval'] < 1440 ) {
+            $cron_time_interval = '0 */'.intval($data['interval']/60).' * * *';
+        }
+
+        // Delete interval in cron if it exists
+        $res = delete_import_from_cron($id);
+        if (!$res) {
+            throw new Exception("Error deleting $file from crontab!");
+        }
+
+        // Write new configuration in cron
+        $res = write_import_in_cron($cron_time_interval, $id);
+        if (!$res) {
+            throw new Exception("Error adding $file to crontab!");
+        }
+
         return $response->withStatus(200);
     } catch (Exception $e) {
         error_log($e->getMessage());
@@ -104,6 +135,10 @@ $app->delete('/phonebook/config/{id}', function (Request $request, Response $res
     try {
         $route = $request->getAttribute('route');
         $id = $route->getArgument('id');
+        $res = delete_import_from_cron($id);
+        if (!$res) {
+            throw new Exception("Error deleting $file from crontab!");
+        }
         $file = '/etc/phonebook/sources.d/'.$id.'.json';
         $res = unlink($file);
         if (!$res) {
@@ -120,24 +155,35 @@ $app->delete('/phonebook/config/{id}', function (Request $request, Response $res
 $app->post('/phonebook/test', function (Request $request, Response $response, $args) {
     try {
         $data = $request->getParsedBody();
-        $cmd = "/usr/bin/python /usr/share/phonebooks/phonebook-import.py --check-db";
-        if (isset($data['query']) && !empty($data['query'])) {
-            $data['query'] = preg_replace('/;$|(LIMIT|limit) [0-9]*(;$|$)/','',$data['query']).' LIMIT 3;';
-        }
+
+        // write a temporary configuration file
+        $id = 'phonebook_test';
+        $file = '/tmp/'.$id.'.json';
+        $newsource = array();
         foreach ( array('dbtype','host','port','user','password','dbname','query') as $var) {
             if (!isset($data[$var]) || empty($data[$var])) {
                 error_log("Missing value: $var");
                 return $response->withJson(array("status"=>"Missing value: $var"), 400);
             }
-            $cmd.= ' '.$var.'='.escapeshellarg($data[$var]);
+            $newsource[$id][$var] = $data[$var];
         }
-        error_log($cmd);
+
+        $res = file_put_contents($file, json_encode(array($id => $newsource)));
+        if ($res === false) {
+           throw new Exception("Error writing $file");
+        }
+
+        $cmd = "/usr/bin/python /usr/share/phonebooks/phonebook-import.py --check --config ".escapeshellarg($file);
         exec($cmd,$output,$return);
+
+        // remove temporary file
+        unlink($file);
+
         if ($return!=0) {
             return $response->withJson(array("status"=>false),200);
         }
         $res = json_decode($output[0]);
-        return $response->withJson($res,200);
+        return $response->withJson(array_slice($res, 0, 3),200);
     } catch (Exception $e) {
         error_log($e->getMessage());
         return $response->withJson(array("status"=>$e->getMessage()), 500);
@@ -150,7 +196,7 @@ $app->post('/phonebook/syncnow/{id}', function (Request $request, Response $resp
         $route = $request->getAttribute('route');
         $id = $route->getArgument('id');
         $file = '/etc/phonebook/sources.d/'.$id.'.json';
-        $cmd = "/usr/bin/python /usr/share/phonebooks/phonebook-import.py --source-id ".escapeshellarg($id);
+        $cmd = "/usr/bin/python /usr/share/phonebooks/phonebook-import.py --config ".escapeshellarg($file);
         exec($cmd,$output,$return);
         if ($return!=0) {
             return $response->withJson(array("status"=>false),500);
@@ -161,4 +207,82 @@ $app->post('/phonebook/syncnow/{id}', function (Request $request, Response $resp
         return $response->withJson(array("status"=>$e->getMessage()), 500);
     }
 });
+
+function delete_import_from_cron($id) {
+    try {
+        $file = '/etc/phonebook/sources.d/'.$id.'.json';
+
+        // Read crontab content
+        exec('/usr/bin/crontab -l 2>/dev/null', $output, $ret);
+        if ($ret != 0) {
+            throw new Exception("Error reading crontab");
+        }
+
+        // Open crontab in a pipe
+        if(!file_exists('/var/log/pbx/www-error.log')) {
+            touch('/var/log/pbx/www-error.log');
+        }
+
+        $descriptorspec = array(
+            0 => array("pipe", "r"),  // stdin
+            1 => array("pipe", "w"),  // stdout
+            2 => array("file", "/var/log/pbx/www-error.log", "a") // stderr
+        );
+
+        $process = proc_open('/usr/bin/crontab -', $descriptorspec, $pipes);
+        if (!is_resource($process)) {
+            throw new Exception("Error opening crontab pipe");
+        }
+
+        foreach ($output as $row) {
+            if (strpos( $row , '/usr/bin/python /usr/share/phonebooks/phonebook-import.py --config') !== FALSE && strpos( $row , $file) !== FALSE ) {
+                continue;
+            }
+            fwrite($pipes[0], $row."\n");
+        }
+        fclose($pipes[0]);
+        return true;
+    } catch (Exception $e) {
+        error_log($e->getMessage());
+        return false;
+    }
+}
+
+
+function write_import_in_cron($cron_time_interval, $id) {
+     try {
+        $file = '/etc/phonebook/sources.d/'.$id.'.json';
+
+        // Read crontab content
+        exec('/usr/bin/crontab -l 2>/dev/null', $output, $ret);
+        if ($ret != 0) {
+            throw new Exception("Error reading crontab");
+        }
+
+        // Open crontab in a pipe
+        if(!file_exists('/var/log/pbx/www-error.log')) {
+            touch('/var/log/pbx/www-error.log');
+        }
+
+        $descriptorspec = array(
+            0 => array("pipe", "r"),  // stdin
+            1 => array("pipe", "w"),  // stdout
+            2 => array("file", "/var/log/pbx/www-error.log", "a") // stderr
+        );
+
+        $process = proc_open('/usr/bin/crontab -', $descriptorspec, $pipes);
+        if (!is_resource($process)) {
+            throw new Exception("Error opening crontab pipe");
+        }
+
+        $output[] = $cron_time_interval.' '.'/usr/bin/python /usr/share/phonebooks/phonebook-import.py --config '.escapeshellarg($file);
+
+        fwrite($pipes[0], join("\n", $output)."\n");
+        fclose($pipes[0]);
+        return true;
+    } catch (Exception $e) {
+        error_log($e->getMessage());
+        return false;
+    }
+}
 
